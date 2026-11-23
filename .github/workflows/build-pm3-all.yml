@@ -1,0 +1,263 @@
+# 一次构建 Proxmark3 的「固件 + Windows 客户端」，两边版本严格同一 commit
+#
+# 背景：官方 CI 每次 push 都会跑完整 make（bootrom + armsrc + client），
+#       但没有 upload-artifact，所以产物随 runner 一起销毁，没有官方下载渠道。
+#       本文件把官方两条 recipe 合到一起，并补上上传步骤。
+#
+# 用法：
+#   1. GitHub 新建一个空仓库（public）
+#   2. 本文件放到 .github/workflows/build-pm3-all.yml
+#   3. Actions -> "Build Proxmark3 (firmware + Windows client)" -> Run workflow
+#   4. 跑完下载两个 artifact：pm3-firmware-* / pm3-windows-client
+#   5. 先解压固件包，看 BUILD_INFO.txt 里的 CAPABILITIES_VERSION 是否为 13
+#
+# 重要：
+#   - platform 必须与设备一致（hw version 里的 "Firmware target" 一行）
+#     PM3GENERIC = Easy / 各种克隆板；PM3RDV4 = 原厂 RDV4；PM5 = Proxmark5
+#   - 256KB 的 Easy 克隆板可能装不下全功能镜像：
+#       extra_args 填 "PLATFORM_SIZE=256 SKIP_DESFIRE_SIM=1 SKIP_FELICA=1 SKIP_ISO15693=1"
+#   - 只刷 fullimage 一般够用；改 bootrom 风险明显更高，非必要不动
+
+name: Build Proxmark3 (firmware + Windows client)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Proxmark3 git ref (tag / branch / full commit sha)"
+        required: true
+        default: "master"
+        type: string
+      platform:
+        description: "目标平台"
+        required: true
+        default: "PM3GENERIC"
+        type: choice
+        options:
+          - PM3GENERIC
+          - PM3RDV4
+          - PM5
+      extra_args:
+        description: "额外的 make 参数（如 PLATFORM_SIZE=256 SKIP_FELICA=1），可留空"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  # ---------------------------------------------------------------- 固件
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout proxmark3
+        uses: actions/checkout@v4
+        with:
+          repository: RfidResearchGroup/proxmark3
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 与官方 ubuntu.yml 的依赖表一致（这里去掉 qt6，因为只编固件）
+      - name: Install dependencies
+        run: |
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt || true
+          sudo apt-get update
+          sudo apt-get install -yqq make build-essential ca-certificates pkg-config \
+            libreadline-dev gcc-arm-none-eabi libnewlib-dev libbz2-dev liblz4-dev \
+            libssl-dev libgd-dev libpython3-dev python3 python3-dev sed
+
+      - name: Install Python dependencies
+        run: pip install -r tools/requirements.txt
+
+      - name: make clean
+        run: make clean
+
+      - name: Build bootrom + fullimage
+        env:
+          V: 1
+        run: |
+          make -j$(( $(nproc) + 1 )) \
+            PLATFORM=${{ inputs.platform }} \
+            ${{ inputs.extra_args }} \
+            bootrom fullimage
+
+      - name: Stage artifacts
+        run: |
+          set -e
+          mkdir -p dist
+          cp bootrom/obj/bootrom.elf      dist/
+          cp bootrom/obj/bootrom.s19      dist/
+          cp armsrc/obj/fullimage.elf     dist/
+          cp armsrc/obj/fullimage.s19     dist/
+
+          CAP=$(grep -E '^#define CAPABILITIES_VERSION' include/pm3_cmd.h | awk '{print $3}')
+          {
+            echo "commit   : $(git rev-parse HEAD)"
+            echo "describe : $(git describe --tags --always --dirty 2>/dev/null || echo n/a)"
+            echo "date     : $(git show -s --format=%cI HEAD)"
+            echo "platform : ${{ inputs.platform }}"
+            echo "args     : ${{ inputs.extra_args }}"
+            echo "CAPABILITIES_VERSION : $CAP"
+            echo
+            echo "fullimage.elf size  : $(stat -c%s dist/fullimage.elf) bytes"
+            echo "bootrom.elf size    : $(stat -c%s dist/bootrom.elf) bytes"
+          } | tee dist/BUILD_INFO.txt
+
+          ls -l dist
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: pm3-firmware-${{ inputs.platform }}
+          path: dist
+          retention-days: 30
+          if-no-files-found: error
+
+  # ------------------------------------------------------- Windows 客户端
+  client-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MSYSTEM: UCRT64
+      PYTHONHOME: /ucrt64
+    steps:
+      - name: Checkout proxmark3
+        uses: actions/checkout@v4
+        with:
+          repository: RfidResearchGroup/proxmark3
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: ProxSpace download
+        run: Invoke-WebRequest "https://github.com/Gator96100/ProxSpace/archive/master.zip" -OutFile "C:\proxspace.zip"
+
+      - name: ProxSpace extract
+        run: Expand-Archive -LiteralPath "C:\proxspace.zip" -DestinationPath "C:\"
+
+      - name: ProxSpace rename
+        run: Get-ChildItem -Path "C:\ProxSpace-*" | Rename-Item -NewName "ProxSpace"
+
+      - name: Overwrite packages.txt for UCRT64
+        run: |
+          @'
+          ##############################
+          # General
+          ##############################
+          git
+          make
+          pkg-config
+          mingw-w64-ucrt-x86_64-cmake
+          procps
+          base-devel
+
+          ##############################
+          # Proxmark3
+          ##############################
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-arm-none-eabi-gcc
+          mingw-w64-ucrt-x86_64-arm-none-eabi-binutils
+          mingw-w64-ucrt-x86_64-arm-none-eabi-newlib
+          mingw-w64-ucrt-x86_64-readline
+          mingw-w64-ucrt-x86_64-libsndfile
+          mingw-w64-ucrt-x86_64-lua
+          mingw-w64-ucrt-x86_64-bzip2
+          mingw-w64-ucrt-x86_64-python
+          mingw-w64-ucrt-x86_64-python-pip
+          mingw-w64-ucrt-x86_64-python-setuptools
+          mingw-w64-ucrt-x86_64-python-cryptography
+          mingw-w64-ucrt-x86_64-jansson
+          mingw-w64-ucrt-x86_64-qt6-base
+          mingw-w64-ucrt-x86_64-gdb
+          mingw-w64-ucrt-x86_64-openocd
+          mingw-w64-ucrt-x86_64-opencl-icd
+          mingw-w64-ucrt-x86_64-lz4
+          mingw-w64-ucrt-x86_64-libgd
+          mingw-w64-ucrt-x86_64-openssl
+          '@ | Set-Content -Path "C:\ProxSpace\setup\packages.txt" -Encoding UTF8
+
+      - name: ProxSpace first run (installs packages)
+        working-directory: C:\ProxSpace
+        run: |
+          $maxAttempts = 3
+          $delay = 20
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            Write-Host "Attempt $i..."
+            ./runme64.bat -c "exit"
+            if ($LASTEXITCODE -eq 0 -and -not (Test-Path setup\installed)) {
+              ./runme64.bat -c ". /etc/post-install/09-proxspace_setup.post"
+            }
+            if ($LASTEXITCODE -eq 0 -and (Test-Path setup\installed)) { exit 0 }
+            if ($i -lt $maxAttempts) { Start-Sleep -Seconds $delay }
+          }
+          exit 1
+
+      - name: Add ProxSpace/MSYS2 to PATH
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ProxSpace\msys2\ucrt64\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ProxSpace\msys2\usr\local\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ProxSpace\msys2\usr\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\ProxSpace\msys2\bin"
+          Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=/ucrt64/lib/pkgconfig:/ucrt64/share/pkgconfig"
+
+      - name: Downgrade ARM linker (official workaround)
+        shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
+        run: pacman -U --noconfirm https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-arm-none-eabi-binutils-2.46.1-1-any.pkg.tar.zst
+
+      - name: Build client
+        shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
+        run: make -j$(( $(nproc) + 1 )) client
+
+      - name: Stage client package
+        shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
+        run: |
+          set -e
+          rm -rf dist && mkdir -p dist/libs
+          cp client/proxmark3.exe dist/
+
+          # 递归收集 exe 及其依赖 DLL（最多 4 层），避免整份 ucrt64\bin 塞进包里
+          queue="client/proxmark3.exe"
+          seen=""
+          for round in 1 2 3 4; do
+            for f in $queue; do
+              for d in $(ldd "$f" 2>/dev/null | awk '{print $3}' | grep -i 'ucrt64' || true); do
+                case " $seen " in
+                  *" $d "*) ;;
+                  *) cp -n "$d" dist/libs/ 2>/dev/null || true; seen="$seen $d"; queue="$queue $d" ;;
+                esac
+              done
+            done
+          done
+
+          # Qt 平台插件（本机实测：放在 libs 里 + 环境变量指向 libs 即可）
+          cp /ucrt64/share/qt6/plugins/platforms/qwindows.dll dist/libs/ 2>/dev/null || true
+
+          for d in cmdscripts luascripts pyscripts lualibs dictionaries resources; do
+            [ -d "client/$d" ] && cp -r "client/$d" dist/
+          done
+          cp client/*.bat dist/ 2>/dev/null || true
+
+          cat > dist/run.bat <<'BAT'
+          @echo off
+          set "HOME=%~dp0"
+          set "QT_PLUGIN_PATH=%~dp0libs"
+          set "QT_QPA_PLATFORM_PLUGIN_PATH=%~dp0libs"
+          set "PATH=%~dp0libs;%~dp0;%PATH%"
+          "%~dp0proxmark3.exe" -p COM4 %*
+          BAT
+
+          du -sh dist; ls dist
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: pm3-windows-client
+          path: dist
+          retention-days: 30
+          if-no-files-found: error
