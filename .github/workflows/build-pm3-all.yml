@@ -1,15 +1,19 @@
 # 一次构建 Proxmark3 的「固件 + Windows 客户端」，两边版本严格同一 commit
 #
+# v2 修订（2026-11-23）：
+#   - 客户端 job 的构建命令从 `make client` 改回官方 recipe 的完整 `make`
+#     （client 依赖 armsrc 生成的 fpga_version_info / fpga_compress，单独 make client 会失败）
+#   - 打包步骤改为纯 PowerShell + objdump 递归解析依赖，不再依赖 bash/ldd/heredoc
+#   - 所有 action 升到 Node 24 版本：checkout@v7 / setup-python@v7 / upload-artifact@v7
+#
 # 背景：官方 CI 每次 push 都会跑完整 make（bootrom + armsrc + client），
 #       但没有 upload-artifact，所以产物随 runner 一起销毁，没有官方下载渠道。
-#       本文件把官方两条 recipe 合到一起，并补上上传步骤。
 #
 # 用法：
-#   1. GitHub 新建一个空仓库（public）
-#   2. 本文件放到 .github/workflows/build-pm3-all.yml
-#   3. Actions -> "Build Proxmark3 (firmware + Windows client)" -> Run workflow
-#   4. 跑完下载两个 artifact：pm3-firmware-* / pm3-windows-client
-#   5. 先解压固件包，看 BUILD_INFO.txt 里的 CAPABILITIES_VERSION 是否为 13
+#   1. 本文件放到仓库的 .github/workflows/build-pm3-all.yml
+#   2. Actions -> "Build Proxmark3 (firmware + Windows client)" -> Run workflow
+#   3. 跑完下载两个 artifact：pm3-firmware-* / pm3-windows-client
+#   4. 先解压固件包，看 BUILD_INFO.txt 里的 CAPABILITIES_VERSION 是否为 13
 #
 # 重要：
 #   - platform 必须与设备一致（hw version 里的 "Firmware target" 一行）
@@ -50,18 +54,18 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout proxmark3
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: RfidResearchGroup/proxmark3
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      # 与官方 ubuntu.yml 的依赖表一致（这里去掉 qt6，因为只编固件）
+      # 与官方 ubuntu.yml 的依赖表一致（去掉 qt6，因为只编固件）
       - name: Install dependencies
         run: |
           sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt || true
@@ -110,7 +114,7 @@ jobs:
           ls -l dist
 
       - name: Upload firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pm3-firmware-${{ inputs.platform }}
           path: dist
@@ -120,7 +124,7 @@ jobs:
   # ------------------------------------------------------- Windows 客户端
   client-windows:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
@@ -129,7 +133,7 @@ jobs:
       PYTHONHOME: /ucrt64
     steps:
       - name: Checkout proxmark3
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: RfidResearchGroup/proxmark3
           ref: ${{ inputs.ref }}
@@ -161,6 +165,7 @@ jobs:
           # Proxmark3
           ##############################
           mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-binutils
           mingw-w64-ucrt-x86_64-arm-none-eabi-gcc
           mingw-w64-ucrt-x86_64-arm-none-eabi-binutils
           mingw-w64-ucrt-x86_64-arm-none-eabi-newlib
@@ -210,52 +215,91 @@ jobs:
         shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
         run: pacman -U --noconfirm https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-arm-none-eabi-binutils-2.46.1-1-any.pkg.tar.zst
 
-      - name: Build client
-        shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
-        run: make -j$(( $(nproc) + 1 )) client
+      - name: Toolchain sanity check
+        run: |
+          where.exe make
+          where.exe gcc
+          where.exe arm-none-eabi-gcc
+          make --version | Select-Object -First 1
+
+      # 官方 windows.yml 就是完整 make：client 依赖 armsrc 生成的
+      # fpga_version_info.c / fpga_compress，单独 make client 会失败
+      - name: Build (full, same as official CI)
+        run: make -j $([System.Environment]::ProcessorCount + 1) V=1
+
+      - name: Verify build products
+        run: |
+          foreach ($f in "client\proxmark3.exe","armsrc\obj\fullimage.elf","bootrom\obj\bootrom.elf") {
+            if (-not (Test-Path $f)) { throw "missing build product: $f" }
+            "{0,-34} {1,10} bytes" -f $f, (Get-Item $f).Length
+          }
 
       - name: Stage client package
-        shell: C:\ProxSpace\msys2\usr\bin\bash.exe -l {0}
         run: |
-          set -e
-          rm -rf dist && mkdir -p dist/libs
-          cp client/proxmark3.exe dist/
+          $ErrorActionPreference = "Stop"
+          $msys = "C:\ProxSpace\msys2\ucrt64"
+          $bin  = Join-Path $msys "bin"
+          if (-not (Get-Command objdump -ErrorAction SilentlyContinue)) { throw "objdump not found on PATH" }
 
-          # 递归收集 exe 及其依赖 DLL（最多 4 层），避免整份 ucrt64\bin 塞进包里
-          queue="client/proxmark3.exe"
-          seen=""
-          for round in 1 2 3 4; do
-            for f in $queue; do
-              for d in $(ldd "$f" 2>/dev/null | awk '{print $3}' | grep -i 'ucrt64' || true); do
-                case " $seen " in
-                  *" $d "*) ;;
-                  *) cp -n "$d" dist/libs/ 2>/dev/null || true; seen="$seen $d"; queue="$queue $d" ;;
-                esac
-              done
-            done
-          done
+          Remove-Item dist -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path dist, dist\libs -Force | Out-Null
 
-          # Qt 平台插件（本机实测：放在 libs 里 + 环境变量指向 libs 即可）
-          cp /ucrt64/share/qt6/plugins/platforms/qwindows.dll dist/libs/ 2>/dev/null || true
+          Copy-Item client\proxmark3.exe dist\ -Force
+          Copy-Item client\*.bat dist\ -Force -ErrorAction SilentlyContinue
 
-          for d in cmdscripts luascripts pyscripts lualibs dictionaries resources; do
-            [ -d "client/$d" ] && cp -r "client/$d" dist/
-          done
-          cp client/*.bat dist/ 2>/dev/null || true
+          # 递归解析依赖：objdump -p 读 PE 导入表，逐层从 ucrt64\bin 取
+          $seen = @{}
+          $queue = New-Object System.Collections.Queue
+          $queue.Enqueue((Resolve-Path client\proxmark3.exe).Path)
+          for ($round = 0; $round -lt 6 -and $queue.Count -gt 0; $round++) {
+            $batch = @()
+            while ($queue.Count -gt 0) { $batch += $queue.Dequeue() }
+            foreach ($f in $batch) {
+              $names = & objdump -p $f 2>$null |
+                       Select-String -Pattern 'DLL Name:\s*(.+)$' |
+                       ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
+              foreach ($n in $names) {
+                if ($seen.ContainsKey($n)) { continue }
+                $seen[$n] = $true
+                $src = Join-Path $bin $n
+                if (Test-Path $src) {
+                  Copy-Item $src dist\libs\ -Force
+                  $queue.Enqueue($src)
+                }
+              }
+            }
+          }
 
-          cat > dist/run.bat <<'BAT'
+          # Qt 平台插件（实测：放 libs 下 + 环境变量指向 libs 即可）
+          $qwin = Get-ChildItem -Path $msys -Recurse -Filter qwindows.dll -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if ($qwin) {
+            Copy-Item $qwin.FullName dist\libs\ -Force
+            "qwindows.dll <- $($qwin.FullName)"
+          } else {
+            Write-Host "::warning::qwindows.dll not found; client may fail to start"
+          }
+
+          foreach ($d in "cmdscripts","luascripts","pyscripts","lualibs","dictionaries","resources") {
+            if (Test-Path "client\$d") { Copy-Item "client\$d" dist\ -Recurse -Force }
+          }
+
+          $bat = @"
           @echo off
           set "HOME=%~dp0"
           set "QT_PLUGIN_PATH=%~dp0libs"
           set "QT_QPA_PLATFORM_PLUGIN_PATH=%~dp0libs"
           set "PATH=%~dp0libs;%~dp0;%PATH%"
           "%~dp0proxmark3.exe" -p COM4 %*
-          BAT
+          "@
+          Set-Content -Path dist\run.bat -Value $bat -Encoding ASCII
 
-          du -sh dist; ls dist
+          "exe   : {0} bytes" -f (Get-Item dist\proxmark3.exe).Length
+          "dlls  : {0}" -f (Get-ChildItem dist\libs -Filter *.dll).Count
+          Get-ChildItem dist | Select-Object Name, Length
 
       - name: Upload client
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pm3-windows-client
           path: dist
