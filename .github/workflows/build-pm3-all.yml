@@ -1,5 +1,11 @@
 # 一次构建 Proxmark3 的「固件 + Windows 客户端」，两边版本严格同一 commit
 #
+# v3 修订（2026-11-23 晚）：
+#   - 固件 job 的 apt 步骤加固：先停掉 unattended-upgrades 等占锁服务，
+#     安装命令加 DPkg::Lock::Timeout / Acquire::Retries / 网络超时，并做 3 次重试
+#   - 固件 job 只装 3 个包（build-essential + gcc-arm-none-eabi + libnewlib-dev），
+#     不再照抄客户端那份上百个依赖的长列表——装得越多越容易卡在 apt 上
+#
 # v2 修订（2026-11-23）：
 #   - 客户端 job 的构建命令从 `make client` 改回官方 recipe 的完整 `make`
 #     （client 依赖 armsrc 生成的 fpga_version_info / fpga_compress，单独 make client 会失败）
@@ -60,22 +66,48 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      # 与官方 ubuntu.yml 的依赖表一致（去掉 qt6，因为只编固件）
-      - name: Install dependencies
+      # 只装固件真正需要的三个包：ARM 工具链 + 主机编译工具 + newlib。
+      # 官方 ubuntu.yml 那份长列表是给「客户端也要编」的场景用的（qt6/gd/ssl/python-dev…），
+      # 装得越多，卡在 apt 上的概率越大。
+      - name: Kill background apt jobs (they hold the dpkg lock)
         run: |
-          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt || true
-          sudo apt-get update
-          sudo apt-get install -yqq make build-essential ca-certificates pkg-config \
-            libreadline-dev gcc-arm-none-eabi libnewlib-dev libbz2-dev liblz4-dev \
-            libssl-dev libgd-dev libpython3-dev python3 python3-dev sed
+          sudo systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+          sudo systemctl mask unattended-upgrades.service 2>/dev/null || true
+          sudo pkill -9 -f unattended-upgr 2>/dev/null || true
+          sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+          sudo dpkg --configure -a || true
+          echo "dpkg lock holders:"; sudo fuser -v /var/lib/dpkg/lock-frontend 2>&1 || true
 
-      - name: Install Python dependencies
-        run: pip install -r tools/requirements.txt
+      - name: Install ARM toolchain (timeout + retries)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -x
+          sudo apt-get update \
+            -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 || true
+
+          ok=0
+          for i in 1 2 3; do
+            echo "=== apt install attempt $i ==="
+            if timeout 600 sudo apt-get install -y --no-install-recommends \
+                 -o DPkg::Lock::Timeout=300 \
+                 -o Acquire::Retries=5 \
+                 -o Acquire::http::Timeout=20 \
+                 -o Acquire::https::Timeout=20 \
+                 build-essential gcc-arm-none-eabi libnewlib-dev; then
+              ok=1; break
+            fi
+            echo "attempt $i failed"; sleep 20
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::apt install failed after 3 attempts"
+            sudo lsof /var/lib/dpkg/lock-frontend 2>/dev/null || true
+            exit 1
+          fi
+
+          arm-none-eabi-gcc --version | head -1
+          make --version | head -1
+          python3 --version
 
       - name: make clean
         run: make clean
