@@ -1,5 +1,10 @@
 # 一次构建 Proxmark3 的「固件 + Windows 客户端」，两边版本严格同一 commit
 #
+# v5 修订（2026-11-25）：
+#   - `latest` 的解析改成「git ls-remote 优先 + 带 token 的 API 兜底」。
+#     原因：GitHub 托管 runner 出口 IP 共享，匿名调 api.github.com 常被 403 限流；
+#     ls-remote 走 git 协议，不占 API 配额。
+#
 # v4 修订（2026-11-25）：
 #   - ref 支持填 `latest`（或留空）：自动解析成 GitHub 上最新的正式 release tag，
 #     不用再去查版本号。想固定就照旧填 tag / 分支 / 完整 commit sha。
@@ -69,13 +74,33 @@ jobs:
     steps:
       - name: Resolve ref
         id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -uo pipefail
           IN="${{ inputs.ref }}"
           if [ -z "$IN" ] || [ "$IN" = "latest" ] || [ "$IN" = "stable" ]; then
-            IN=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-                   https://api.github.com/repos/RfidResearchGroup/proxmark3/releases/latest \
-                 | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
-            echo "latest release -> $IN"
+            # 1) 首选 git ls-remote：走 git 协议，不消耗 API 配额，不会被 403 限流
+            IN=$(git ls-remote --tags --refs \
+                   https://github.com/RfidResearchGroup/proxmark3.git \
+                 | awk -F'/' '{print $NF}' \
+                 | grep -E '^v4\.[0-9]+$' \
+                 | sort -V | tail -1 || true)
+            echo "ls-remote -> ${IN:-<empty>}"
+
+            # 2) 兜底：带 token 的 API（认证后 5000 次/小时，不会 403）
+            if [ -z "$IN" ]; then
+              echo "falling back to REST API with token"
+              IN=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                     -H "Accept: application/vnd.github+json" \
+                     https://api.github.com/repos/RfidResearchGroup/proxmark3/releases/latest \
+                   | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])" || true)
+            fi
+          fi
+
+          if [ -z "${IN:-}" ]; then
+            echo "::error::could not resolve ref, please type the tag manually (e.g. v4.23346)"
+            exit 1
           fi
           echo "ref=$IN" >> "$GITHUB_OUTPUT"
           echo "### 构建 ref：\`$IN\`" >> "$GITHUB_STEP_SUMMARY"
